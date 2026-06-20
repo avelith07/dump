@@ -1,0 +1,12 @@
+#!/bin/bash
+
+export DISPLAY=:0
+export PULSE_SERVER=127.0.0.1
+export GALLIUM_DRIVER=virpipe
+export MESA_NO_ERROR=1
+export MESA_SHADER_CACHE_DISABLE=false
+export MESA_NO_WAIT_FOR_VBLANK=1
+export vblank_mode=0
+export ZINK_DESCRIPTORS=lazy
+
+de-wm-app &
