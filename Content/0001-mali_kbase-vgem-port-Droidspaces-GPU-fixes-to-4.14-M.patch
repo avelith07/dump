@@ -1,0 +1,192 @@
+From 7ebc3ad686027a04c419059bb5b8efb72a3357d7 Mon Sep 17 00:00:00 2001
+From: Subham Nayak <fstab.subhu@gmail.com>
+Date: Sun, 1 Nov 2026 21:17:15 +0530
+Subject: [PATCH] mali_kbase/vgem: port Droidspaces GPU fixes to 4.14 MT6785
+
+Port the two kernel-side fixes needed to use the Mali GPU from inside a
+container to this 4.14 MT6785 tree.
+
+mali_kbase r25p0 (Bifrost and Valhall):
+The r38p1 fix removes a find_get_pid(kctx->tgid) lookup that resolves the
+init-namespace tgid in the caller's pid namespace. r25p0 has no such
+lookup, so add the task tracking that the newer driver relies on: keep a
+reference on current->group_leader for the lifetime of each userspace
+context. Kernel-created contexts have no filp and are left alone.
+
+drm/vgem:
+drm_clflush_pages() is a no-op that warns on arm64, so only call it on
+x86/powerpc. Open-code vma_set_file() with get_file()/fput() so vgem
+does not depend on symbols GKI or Non-GKI does not export to vendor modules (Non-GKI vendor modules if any).
+
+Build-tested: bifrost r25p0 midgard, vgem as an arm64 module. Should work as built-in also.
+---
+ drivers/gpu/drm/vgem/vgem_drv.c                    | 10 ++++++++--
+ .../gpu/arm/midgard/context/mali_kbase_context.c   | 14 ++++++++++++++
+ .../drivers/gpu/arm/midgard/mali_kbase_defs.h      |  4 ++++
+ .../gpu/arm/midgard/context/mali_kbase_context.c   | 14 ++++++++++++++
+ .../drivers/gpu/arm/midgard/mali_kbase_defs.h      |  4 ++++
+ 5 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/vgem/vgem_drv.c b/drivers/gpu/drm/vgem/vgem_drv.c
+index a1f976270..44c338725 100644
+--- a/drivers/gpu/drm/vgem/vgem_drv.c
++++ b/drivers/gpu/drm/vgem/vgem_drv.c
+@@ -288,7 +288,7 @@ static void vgem_unpin_pages(struct drm_vgem_gem_object *bo)
+ static int vgem_prime_pin(struct drm_gem_object *obj)
+ {
+ 	struct drm_vgem_gem_object *bo = to_vgem_bo(obj);
+-	long n_pages = obj->size >> PAGE_SHIFT;
++	long n_pages __maybe_unused = obj->size >> PAGE_SHIFT;
+ 	struct page **pages;
+ 
+ 	pages = vgem_pin_pages(bo);
+@@ -297,8 +297,12 @@ static int vgem_prime_pin(struct drm_gem_object *obj)
+ 
+ 	/* Flush the object from the CPU cache so that importers can rely
+ 	 * on coherent indirect access via the exported dma-address.
++	 * drm_clflush_pages() only does that on x86 and powerpc, elsewhere it
++	 * just warns, and GKI does not export it to vendor modules.
+ 	 */
++#if defined(CONFIG_X86) || defined(__powerpc__)
+ 	drm_clflush_pages(pages, n_pages);
++#endif
+ 
+ 	return 0;
+ }
+@@ -386,8 +390,10 @@ static int vgem_prime_mmap(struct drm_gem_object *obj,
+ 	if (ret)
+ 		return ret;
+ 
++	/* vma_set_file(), open coded: GKI does not export it to vendor modules */
++	get_file(obj->filp);
+ 	fput(vma->vm_file);
+-	vma->vm_file = get_file(obj->filp);
++	vma->vm_file = obj->filp;
+ 	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+ 	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+ 
+diff --git a/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c b/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+index a106c357d..19b4cccaa 100644
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <mali_kbase.h>
++#include <linux/sched/task.h>
+ #include <gpu/mali_kbase_gpu_regmap.h>
+ #include <mali_kbase_mem_linux.h>
+ #include <mali_kbase_dma_fence.h>
+@@ -191,6 +192,16 @@ int kbase_context_common_init(struct kbase_context *kctx)
+ 	kctx->tgid = current->tgid;
+ 	kctx->pid = current->pid;
+ 
++	/* Hold a reference on the thread group leader for the lifetime of the
++	 * context. The numeric tgid is only meaningful in the init pid
++	 * namespace, so it must not be looked up again from a caller that may
++	 * be in another namespace. Kernel contexts have no filp.
++	 */
++	if (likely(kctx->filp)) {
++		kctx->task = current->group_leader;
++		get_task_struct(kctx->task);
++	}
++
+ 	atomic_set(&kctx->used_pages, 0);
+ 
+ 	mutex_init(&kctx->reg_lock);
+@@ -303,6 +314,9 @@ void kbase_context_common_term(struct kbase_context *kctx)
+ 	if (atomic_read(&kctx->kbdev->timeline_flags) != 0)
+ 		kbase_timeline_streams_flush(kctx->kbdev->timeline);
+ 
++	if (kctx->task)
++		put_task_struct(kctx->task);
++
+ 	vfree(kctx);
+ }
+ 
+diff --git a/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h b/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
+index a5064b041..471775760 100644
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_bifrost/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
+@@ -1413,6 +1413,9 @@ struct kbase_sub_alloc {
+  *                        which actually created the context. This is usually,
+  *                        but not necessarily, the same as the thread which
+  *                        opened the device file /dev/malixx instance.
++ * @task:                 Thread group leader of the process that created the
++ *                        context, with a reference held for the lifetime of
++ *                        the context.
+  * @jctx:                 object encapsulating all the Job dispatcher related state,
+  *                        including the array of atoms.
+  * @used_pages:           Keeps a track of the number of 4KB physical pages in use
+@@ -1652,6 +1655,7 @@ struct kbase_context {
+ 	wait_queue_head_t event_queue;
+ 	pid_t tgid;
+ 	pid_t pid;
++	struct task_struct *task;
+ 	atomic_t used_pages;
+ 	atomic_t nonmapped_pages;
+ 	atomic_t permanent_mapped_pages;
+diff --git a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+index 5c2722467..9befba6f8 100644
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/context/mali_kbase_context.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <mali_kbase.h>
++#include <linux/sched/task.h>
+ #include <gpu/mali_kbase_gpu_regmap.h>
+ #include <mali_kbase_mem_linux.h>
+ #include <mali_kbase_dma_fence.h>
+@@ -144,6 +145,16 @@ int kbase_context_common_init(struct kbase_context *kctx)
+ 	kctx->tgid = current->tgid;
+ 	kctx->pid = current->pid;
+ 
++	/* Hold a reference on the thread group leader for the lifetime of the
++	 * context. The numeric tgid is only meaningful in the init pid
++	 * namespace, so it must not be looked up again from a caller that may
++	 * be in another namespace. Kernel contexts have no filp.
++	 */
++	if (likely(kctx->filp)) {
++		kctx->task = current->group_leader;
++		get_task_struct(kctx->task);
++	}
++
+ 	atomic_set(&kctx->used_pages, 0);
+ 
+ 	mutex_init(&kctx->reg_lock);
+@@ -254,6 +265,9 @@ void kbase_context_common_term(struct kbase_context *kctx)
+ 	if (atomic_read(&kctx->kbdev->timeline_flags) != 0)
+ 		kbase_timeline_streams_flush(kctx->kbdev->timeline);
+ 
++	if (kctx->task)
++		put_task_struct(kctx->task);
++
+ 	vfree(kctx);
+ }
+ 
+diff --git a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
+index a71570723..665d15714 100644
+--- a/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
++++ b/drivers/misc/mediatek/gpu/gpu_mali/mali_valhall/mali-r25p0/drivers/gpu/arm/midgard/mali_kbase_defs.h
+@@ -1403,6 +1403,9 @@ struct kbase_sub_alloc {
+  *                        which actually created the context. This is usually,
+  *                        but not necessarily, the same as the thread which
+  *                        opened the device file /dev/malixx instance.
++ * @task:                 Thread group leader of the process that created the
++ *                        context, with a reference held for the lifetime of
++ *                        the context.
+  * @jctx:                 object encapsulating all the Job dispatcher related state,
+  *                        including the array of atoms.
+  * @used_pages:           Keeps a track of the number of 4KB physical pages in use
+@@ -1642,6 +1645,7 @@ struct kbase_context {
+ 	wait_queue_head_t event_queue;
+ 	pid_t tgid;
+ 	pid_t pid;
++	struct task_struct *task;
+ 	atomic_t used_pages;
+ 	atomic_t nonmapped_pages;
+ 	atomic_t permanent_mapped_pages;
+-- 
+2.53.0
+
