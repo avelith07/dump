@@ -1,0 +1,2 @@
+su -c "cmd overlay fabricate --target android --name NoIMENavBar android:bool/config_imeDrawsImeNavBar 0x12 0"
+su -c "cmd overlay enable --user current com.android.shell:NoIMENavBar"

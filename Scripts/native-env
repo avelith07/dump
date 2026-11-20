@@ -1,0 +1,8 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+termux-x11 &
+virgl_test_server_android &
+pulseaudio --start --exit-idle-time=-1 && pactl load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1
+sleep 2
+
+chmod -R 777 $PREFIX/tmp

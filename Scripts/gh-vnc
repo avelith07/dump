@@ -1,0 +1,23 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# Change the DISPLAY to your one
+# Change the GH CS value to your GitHub Codespace name with id
+export DISPLAY=:0
+GH_CS="rgnfhesehjwed-rotdhs-phhne-x54xsyfs8wxq76hxp4"
+
+# Start tunnel silently if not running
+gh cs ports forward 5901:5901 -c "$GH_CS" &
+
+# Give it a moment
+sleep 2
+
+am start --user 0 -n com.termux.x11/com.termux.x11.MainActivity >/dev/null 2>&1
+sleep 2
+
+# Start viewer (TX11 must be running)
+vncviewer localhost:5901 \
+  -PreferredEncoding=Tight \
+  -CompressLevel=1 \
+  -QualityLevel=5 \
+  -AutoSelect=0
+
