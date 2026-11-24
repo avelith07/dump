@@ -10,6 +10,7 @@ sudo apt install -y \
     libssl-dev \
     libelf-dev \
     bc \
+    cpio \
     bison \
     flex \
     device-tree-compiler \
